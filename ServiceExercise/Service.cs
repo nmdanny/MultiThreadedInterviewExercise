@@ -1,119 +1,74 @@
-﻿using ConnectionPool;
 using System;
 using System.Collections.Concurrent;
-using System.Collections.Generic;
-using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 
-namespace ServiceExercise
+namespace ConnectionPool
 {
-    public class Service : IService, IDisposable
+    public class Service : IService
     {
-        private List<Task<int>> tasks;
-        int sum;
-        private SemaphoreSlim semaphore;
-        private Connection c;
-        BlockingCollection<Request> q = new BlockingCollection<Request>();
-        bool produceRunning = false;
-        private readonly object produceLock = new object();
-        public Service(int CONNETION_COUNT)
-        {
-            sum = 0;
-            c = new Connection();
-            tasks = new List<Task<int>>();
-            semaphore = new SemaphoreSlim(CONNETION_COUNT);
-        }
+        private const int WorkersCount = 10;
+        private readonly int _connectionsCount;
+        private int _sum;
+        private int _count;
+        private readonly object _lockObject = new object();
+        private readonly BlockingCollection<Request> _requests = new BlockingCollection<Request>();
+        private readonly BlockingCollection<Connection> _connections = new BlockingCollection<Connection>();
 
-        /// <summary>
-        /// returns the sum in the current time of the service
-        /// </summary>
-        /// <returns></returns>
-        public int getSummary()
+        public Service(int connectionsCount)
         {
-            return sum;
-        }
-
-        /// <summary>
-        /// Double check if the queue is empty when we notify that no more loading is done. and dispose the connection
-        /// </summary>
-        public void notifyFinishedLoading()
-        {
-            if (produceRunning == false)
+            _connectionsCount = connectionsCount;
+            for (var i = 1; i <= _connectionsCount; i++)
             {
-                lock (produceLock)
-                {
-                    produceRunning = true;
-                    Produce();
-                    produceRunning = false;
-                }
+                _connections.Add(new Connection());
             }
-            while (q.Count != 0) ;
-            Task.WaitAll(tasks.ToArray());
-            Console.WriteLine("Finished loading");
-            Dispose();
-        }
 
-        /// <summary>
-        /// Adds requests to the queue, and runs the produce function one at a time
-        /// </summary>
-        /// <param name="request"></param>
+            for (var i = 0; i < WorkersCount; i++)
+            {
+                Task.Factory.StartNew(HandleRequests);
+            }
+            
+        }
+        
         public void sendRequest(Request request)
         {
-            Console.WriteLine(request.Command + " has entered the q");
-            q.Add(request);
-
-
-            if (produceRunning == false)
-            {
-                Task.Run(() =>
-                {
-                    lock (produceLock)
-                    {
-                        Console.WriteLine("------------------------------------------- this is hapaning ---------------------------------------");
-                        produceRunning = true;
-                        Produce();
-                        produceRunning = false;
-                        Console.WriteLine("||||||||||||||||||||||||||||||||||||||||||| this is hapaning |||||||||||||||||||||||||||||||||||||||||||");
-                    }
-                });
-            }
-            
-
+            _requests.Add(request);
+            Console.WriteLine($"{request.Command} request added");
         }
 
-        /// <summary>
-        /// Go over all the requests in the queue, using semaphore so it will use only 4 requests at a time.
-        /// </summary>
-        public void Produce()
-        {   
-            Task<int> t = null;
-            while (q.Count > 0)
-            {
-                var request = q.Take();
-                Console.WriteLine(request.Command + " has entered the Produce function");
-                semaphore.Wait();
-
-                Console.WriteLine(request.Command + " has entered the semaphore");
-                t = c.runCommandAsync(request.Command);
-                tasks.Add(t);
-
-                t.ContinueWith((x) =>
-                {
-                    semaphore.Release();
-                    sum += x.Result;
-                    Console.WriteLine(request.Command + " has left the semaphore");
-                });
-            }
-        }
-
-
-        public void Dispose()
+        public void notifyFinishedLoading()
         {
-            
-            semaphore.Dispose();
-            q.Dispose();
-            c.Dispose();
+            _requests.CompleteAdding();
         }
+
+        public int getSummary()
+        {
+            var processingFinished = _requests.IsCompleted && _connections.Count == _connectionsCount;
+            while (!processingFinished)
+            {
+                Thread.Sleep(1000);
+                processingFinished = _requests.IsCompleted && _connections.Count == _connectionsCount;
+            }
+            Console.WriteLine($"Processed {_count} requests");
+            return _sum;
+        }
+
+        private async Task HandleRequests()
+        {
+            while(!_requests.IsCompleted)
+            {
+                _requests.TryTake(out var request);
+                if(request == null) continue;
+                var connection = _connections.Take();
+                var result = await connection.runCommandAsync(request.Command);
+                lock (_lockObject)
+                {
+                    _count++;
+                    _sum += result;
+                }
+                _connections.Add(connection);
+            }
+        }
+        
     }
 }
