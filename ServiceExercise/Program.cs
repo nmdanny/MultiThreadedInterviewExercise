@@ -1,5 +1,4 @@
-﻿using ServiceExercise;
-using System;
+﻿using System;
 
 namespace ConnectionPool {
     public class Program {
