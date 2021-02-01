@@ -1,73 +1,58 @@
 using System;
+using System.Collections.Generic;
 using System.Collections.Concurrent;
 using System.Threading;
+using System.Linq;
 using System.Threading.Tasks;
+using System.Threading.Channels;
 
 namespace ConnectionPool
 {
     public class Service : IService
     {
-        private const int WorkersCount = 10;
         private readonly int _connectionsCount;
-        private int _sum;
-        private int _count;
-        private readonly object _lockObject = new object();
-        private readonly BlockingCollection<Request> _requests = new BlockingCollection<Request>();
-        private readonly BlockingCollection<Connection> _connections = new BlockingCollection<Connection>();
+        private readonly Channel<Request> _requests = Channel.CreateUnbounded<Request>();
+        private readonly List<Task<int>> _workerTasks = new List<Task<int>>();
 
         public Service(int connectionsCount)
         {
             _connectionsCount = connectionsCount;
-            for (var i = 1; i <= _connectionsCount; i++)
+            for (var i = 0; i < _connectionsCount; i++)
             {
-                _connections.Add(new Connection());
+                var workerTask = Task.Run(() => HandleRequests(new Connection()));
+                _workerTasks.Add(workerTask);
             }
-
-            for (var i = 0; i < WorkersCount; i++)
-            {
-                Task.Factory.StartNew(HandleRequests);
-            }
-            
         }
         
         public void sendRequest(Request request)
         {
-            _requests.Add(request);
-            Console.WriteLine($"{request.Command} request added");
+            bool success = _requests.Writer.TryWrite(request);
+            if (!success) {
+                // since our channel is unbounded, this is the only reason for failure
+                throw new InvalidOperationException("Tried writing a request to a closed channel");
+            }
         }
 
         public void notifyFinishedLoading()
         {
-            _requests.CompleteAdding();
+            _requests.Writer.Complete();
         }
 
         public int getSummary()
         {
-            var processingFinished = _requests.IsCompleted && _connections.Count == _connectionsCount;
-            while (!processingFinished)
-            {
-                Thread.Sleep(1000);
-                processingFinished = _requests.IsCompleted && _connections.Count == _connectionsCount;
-            }
-            Console.WriteLine($"Processed {_count} requests");
-            return _sum;
+            Task.WaitAll(_workerTasks.ToArray());
+            return _workerTasks.Select(t => t.Result).Sum();
         }
 
-        private async Task HandleRequests()
+        private async Task<int> HandleRequests(Connection connection)
         {
-            while(!_requests.IsCompleted)
-            {
-                _requests.TryTake(out var request);
-                if(request == null) continue;
-                var connection = _connections.Take();
+            int sum = 0;
+            while(!_requests.Reader.Completion.IsCompleted) {
+                var request = await _requests.Reader.ReadAsync();
                 var result = await connection.runCommandAsync(request.Command);
-                lock (_lockObject)
-                {
-                    _count++;
-                    _sum += result;
-                }
-                _connections.Add(connection);
+                sum += result;
             }
+            return sum;
         }
         
     }
